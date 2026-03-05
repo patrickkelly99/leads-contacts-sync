@@ -1,14 +1,18 @@
 /**
  * Monday.com Leads ↔ Contacts Auto-Sync
  * =======================================
- * Runs on a cron schedule and:
- *  1. Fetches all Leads that have a linked Contact
- *  2. Reads contact name, title, email, phone from the Contacts board
- *  3. Writes those values into the Lead's corresponding columns
- *  4. Also scans Leads with a Contact Name but no linked Contact,
- *     and attempts to auto-match by name/company in the Contacts board
+ * Runs on a cron schedule and does TWO things:
  *
- * Schedule: Every day at 8am, and every 4 hours during business hours
+ * PHASE 1 — AUTO-MATCH
+ *   Scans leads with no linked contact and tries to find a matching
+ *   contact by comparing the lead's company name against contact names.
+ *   If a confident match is found, it links them automatically.
+ *
+ * PHASE 2 — DATA SYNC
+ *   For all leads that have a linked contact (including newly matched ones),
+ *   copies name, title, email, and phone into the lead's columns.
+ *
+ * Schedule: 8am, 12pm, 4pm, 8pm Dubai time
  */
 
 require("dotenv").config();
@@ -20,27 +24,28 @@ const axios = require("axios");
 const MONDAY_API_URL = "https://api.monday.com/v2";
 const API_KEY = process.env.MONDAY_API_KEY;
 
-const LEADS_BOARD_ID = 1634744525;
+const LEADS_BOARD_ID    = 1634744525;
 const CONTACTS_BOARD_ID = 1634744523;
 
 // Column IDs on Leads board
 const LEADS_COLS = {
-  contactName:    "text_mkwfsm3m",
-  title:          "text",
-  email:          "lead_email",
-  phone:          "lead_phone",
-  contactRelation:"board_relation_mm0173f",
+  contactName:     "text_mkwfsm3m",
+  title:           "text",
+  email:           "lead_email",
+  phone:           "lead_phone",
+  contactRelation: "board_relation_mm0173f",
+  companyName:     "lead_company",
 };
 
 // Column IDs on Contacts board
 const CONTACTS_COLS = {
-  firstName:  "first_name__1",
-  lastName:   "last_name__1",
-  position:   "text_mktbyyy1",
-  email:      "email_mkyw8fdq",
-  phone:      "phone_mkyw7n",
-  emailDup:   "text_mkyw2pw6",   // fallback email field
-  phoneDup:   "text_mkywnmn4",   // fallback phone field
+  firstName: "first_name__1",
+  lastName:  "last_name__1",
+  position:  "text_mktbyyy1",
+  email:     "email_mkyw8fdq",
+  phone:     "phone_mkyw7n",
+  emailDup:  "text_mkyw2pw6",
+  phoneDup:  "text_mkywnmn4",
 };
 
 // ─── API Helper ────────────────────────────────────────────────────────────
@@ -57,17 +62,19 @@ async function mondayQuery(query, variables = {}) {
       },
     }
   );
-
   if (response.data.errors) {
     throw new Error(JSON.stringify(response.data.errors));
   }
-
   return response.data.data;
 }
 
-// ─── Fetch Leads with linked contacts ──────────────────────────────────────
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-async function fetchLeadsWithContacts(cursor = null) {
+// ─── Fetch all leads (paginated) ───────────────────────────────────────────
+
+async function fetchAllLeads() {
   const query = `
     query ($boardId: ID!, $cursor: String, $columnIds: [String!]!) {
       boards(ids: [$boardId]) {
@@ -87,25 +94,32 @@ async function fetchLeadsWithContacts(cursor = null) {
     }
   `;
 
-  const variables = {
-    boardId: String(LEADS_BOARD_ID),
-    cursor,
-    columnIds: Object.values(LEADS_COLS),
-  };
+  let cursor = null;
+  const allLeads = [];
 
-  const data = await mondayQuery(query, variables);
-  return data.boards[0].items_page;
+  do {
+    const data = await mondayQuery(query, {
+      boardId: String(LEADS_BOARD_ID),
+      cursor,
+      columnIds: Object.values(LEADS_COLS),
+    });
+    const page = data.boards[0].items_page;
+    allLeads.push(...page.items);
+    cursor = page.cursor;
+    await sleep(300);
+  } while (cursor);
+
+  return allLeads;
 }
 
-// ─── Fetch specific contacts by ID ─────────────────────────────────────────
+// ─── Fetch ALL contacts (paginated) ────────────────────────────────────────
 
-async function fetchContactsByIds(ids) {
-  if (!ids.length) return [];
-
+async function fetchAllContacts() {
   const query = `
-    query ($boardId: ID!, $itemIds: [ID!]!, $columnIds: [String!]!) {
+    query ($boardId: ID!, $cursor: String, $columnIds: [String!]!) {
       boards(ids: [$boardId]) {
-        items_page(limit: 100) {
+        items_page(limit: 500, cursor: $cursor) {
+          cursor
           items {
             id
             name
@@ -120,30 +134,101 @@ async function fetchContactsByIds(ids) {
     }
   `;
 
-  // monday.com v2 supports filtering by item IDs via items_page with ids argument
-  const queryWithIds = `
-    query ($ids: [ID!]!, $columnIds: [String!]!) {
-      items(ids: $ids, limit: 100) {
-        id
-        name
-        column_values(ids: $columnIds) {
-          id
-          value
-          text
-        }
-      }
-    }
-  `;
+  let cursor = null;
+  const allContacts = [];
 
-  const data = await mondayQuery(queryWithIds, {
-    ids: ids.map(String),
-    columnIds: Object.values(CONTACTS_COLS),
-  });
+  do {
+    const data = await mondayQuery(query, {
+      boardId: String(CONTACTS_BOARD_ID),
+      cursor,
+      columnIds: Object.values(CONTACTS_COLS),
+    });
+    const page = data.boards[0].items_page;
+    allContacts.push(...page.items);
+    cursor = page.cursor;
+    await sleep(300);
+  } while (cursor);
 
-  return data.items || [];
+  return allContacts;
 }
 
-// ─── Parse contact column values ───────────────────────────────────────────
+// ─── Normalise string for fuzzy matching ───────────────────────────────────
+// Strips legal suffixes, punctuation, extra spaces so
+// "Iron Mountain Incorporated (UAE)" matches "Ako - Iron Mountain"
+
+function normalise(str) {
+  if (!str) return "";
+  return str
+    .toLowerCase()
+    .replace(/\b(llc|fze|fzco|fzc|l\.l\.c\.|w\.l\.l\.|q\.p\.s\.c\.|b\.s\.c|inc|ltd|limited|co\.|group|logistics|international|middle east|uae|dubai)\b/g, "")
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ─── Build searchable index from contacts ──────────────────────────────────
+// Contact names follow "Salija - MOMENTUM LOGISTICS - MOMENTUM LOGISTICS"
+// We extract every meaningful part as a searchable token
+
+function buildContactIndex(contacts) {
+  return contacts.map((c) => {
+    const parts  = c.name.split(/\s*[-–]\s*/);
+    const tokens = parts
+      .map((p) => normalise(p))
+      .filter((p) => p.length > 2);
+    return { contactId: c.id, tokens };
+  });
+}
+
+// ─── Find best matching contact for a lead ─────────────────────────────────
+
+function findMatch(lead, contactIndex) {
+  const leadName    = normalise(lead.name);
+  const leadCompany = normalise(
+    lead.column_values.find((c) => c.id === LEADS_COLS.companyName)?.text || ""
+  );
+
+  const scored = contactIndex.map(({ contactId, tokens }) => {
+    let score = 0;
+    for (const token of tokens) {
+      if (!token) continue;
+      if (leadName.includes(token) || leadCompany.includes(token)) {
+        score += token.length;
+      }
+      if (token.includes(leadName) || (leadCompany && token.includes(leadCompany))) {
+        score += Math.min(leadName.length, leadCompany.length || leadName.length);
+      }
+    }
+    return { contactId, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+
+  // Minimum score of 5 to avoid false positives (5-char token matched)
+  return best && best.score >= 5 ? best.contactId : null;
+}
+
+// ─── Link a contact to a lead ──────────────────────────────────────────────
+
+async function linkContactToLead(leadId, contactId) {
+  await mondayQuery(
+    `mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+      change_multiple_column_values(
+        board_id: $boardId, item_id: $itemId, column_values: $columnValues
+      ) { id }
+    }`,
+    {
+      boardId: String(LEADS_BOARD_ID),
+      itemId:  String(leadId),
+      columnValues: JSON.stringify({
+        [LEADS_COLS.contactRelation]: { item_ids: [Number(contactId)] },
+      }),
+    }
+  );
+}
+
+// ─── Parse contact into usable fields ─────────────────────────────────────
 
 function parseContact(contact) {
   const cols = {};
@@ -151,29 +236,21 @@ function parseContact(contact) {
     cols[cv.id] = { value: cv.value, text: cv.text };
   }
 
-  const firstName = cols[CONTACTS_COLS.firstName]?.text?.trim() || "";
-  const lastName  = cols[CONTACTS_COLS.lastName]?.text?.trim()  || "";
-
-  // Clean first name — strip company name suffixes like "Ako - ISS" → "Ako"
+  const firstName  = cols[CONTACTS_COLS.firstName]?.text?.trim() || "";
+  const lastName   = cols[CONTACTS_COLS.lastName]?.text?.trim()  || "";
   const cleanFirst = firstName.replace(/\s*[-–]\s*[A-Z].*$/, "").trim();
-  const fullName = [cleanFirst, lastName].filter(Boolean).join(" ") || contact.name.split(" - ")[0].trim();
+  const fullName   = [cleanFirst, lastName].filter(Boolean).join(" ")
+                     || contact.name.split(/\s*[-–]\s*/)[0].trim();
 
   const position = cols[CONTACTS_COLS.position]?.text?.trim() || "";
 
-  // Email: prefer proper email column, fall back to dup field
   let email = cols[CONTACTS_COLS.email]?.text?.trim() || "";
   if (!email) {
-    const emailDup = cols[CONTACTS_COLS.emailDup]?.text?.trim() || "";
-    // Strip surrounding quotes if present
-    email = emailDup.replace(/^["']|["']$/g, "").trim();
+    email = (cols[CONTACTS_COLS.emailDup]?.text || "").replace(/^["']|["']$/g, "").trim();
   }
 
-  // Phone: prefer phone column text, fall back to dup field
   let phone = cols[CONTACTS_COLS.phone]?.text?.trim() || "";
-  if (!phone) {
-    phone = cols[CONTACTS_COLS.phoneDup]?.text?.trim() || "";
-  }
-  // Normalise phone → E.164 style with +971 prefix if needed
+  if (!phone) phone = cols[CONTACTS_COLS.phoneDup]?.text?.trim() || "";
   phone = normalisePhone(phone);
 
   return { fullName, position, email, phone };
@@ -181,19 +258,39 @@ function parseContact(contact) {
 
 function normalisePhone(raw) {
   if (!raw) return "";
-  // Strip spaces, dashes
   let p = raw.replace(/[\s\-().]/g, "");
-  // Already has country code
-  if (p.startsWith("+")) return p;
+  if (p.startsWith("+"))   return p;
   if (p.startsWith("971")) return "+" + p;
-  // Local UAE number starting with 0
-  if (p.startsWith("0")) return "+971" + p.slice(1);
-  // Bare number (e.g. 505595985) — assume UAE
-  if (p.length === 9) return "+971" + p;
+  if (p.startsWith("0"))   return "+971" + p.slice(1);
+  if (p.length === 9)      return "+971" + p;
   return p;
 }
 
-// ─── Parse linked contact IDs from a lead ──────────────────────────────────
+// ─── Update lead's contact fields ──────────────────────────────────────────
+
+async function updateLeadFields(leadId, { fullName, position, email, phone }) {
+  const columnValues = {};
+  if (fullName) columnValues[LEADS_COLS.contactName] = fullName;
+  if (position) columnValues[LEADS_COLS.title]       = position;
+  if (email)    columnValues[LEADS_COLS.email]       = { email, text: email };
+  if (phone)    columnValues[LEADS_COLS.phone]       = { phone, countryShortName: "AE" };
+
+  if (!Object.keys(columnValues).length) return false;
+
+  await mondayQuery(
+    `mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+      change_multiple_column_values(
+        board_id: $boardId, item_id: $itemId, column_values: $columnValues
+      ) { id }
+    }`,
+    {
+      boardId: String(LEADS_BOARD_ID),
+      itemId:  String(leadId),
+      columnValues: JSON.stringify(columnValues),
+    }
+  );
+  return true;
+}
 
 function getLinkedContactIds(lead) {
   const rel = lead.column_values.find((c) => c.id === LEADS_COLS.contactRelation);
@@ -206,136 +303,118 @@ function getLinkedContactIds(lead) {
   }
 }
 
-// ─── Update a lead's contact fields ────────────────────────────────────────
-
-async function updateLead(leadId, { fullName, position, email, phone }) {
-  const columnValues = {};
-
-  if (fullName)   columnValues[LEADS_COLS.contactName] = fullName;
-  if (position)   columnValues[LEADS_COLS.title]       = position;
-  if (email)      columnValues[LEADS_COLS.email]       = { email, text: email };
-  if (phone)      columnValues[LEADS_COLS.phone]       = { phone, countryShortName: "AE" };
-
-  if (!Object.keys(columnValues).length) return false;
-
-  const mutation = `
-    mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
-      change_multiple_column_values(
-        board_id: $boardId,
-        item_id: $itemId,
-        column_values: $columnValues
-      ) { id }
-    }
-  `;
-
-  await mondayQuery(mutation, {
-    boardId: String(LEADS_BOARD_ID),
-    itemId:  String(leadId),
-    columnValues: JSON.stringify(columnValues),
-  });
-
-  return true;
-}
-
-// ─── Main sync logic ───────────────────────────────────────────────────────
+// ─── MAIN SYNC ─────────────────────────────────────────────────────────────
 
 async function runSync() {
   const timestamp = new Date().toISOString();
   console.log(`\n[${timestamp}] 🔄 Starting Leads ↔ Contacts sync...`);
 
-  let cursor = null;
-  let totalLeads = 0;
-  let updatedLeads = 0;
-  let skippedLeads = 0;
+  let autoMatched = 0;
+  let dataUpdated = 0;
+  let skipped     = 0;
 
   try {
-    do {
-      const page = await fetchLeadsWithContacts(cursor);
-      cursor = page.cursor;
+    console.log("  📥 Loading all leads and contacts...");
+    const [allLeads, allContacts] = await Promise.all([
+      fetchAllLeads(),
+      fetchAllContacts(),
+    ]);
+    console.log(`  📋 ${allLeads.length} leads | ${allContacts.length} contacts loaded`);
 
-      const leads = page.items;
-      totalLeads += leads.length;
+    const contactMap   = Object.fromEntries(allContacts.map((c) => [c.id, c]));
+    const contactIndex = buildContactIndex(allContacts);
 
-      // Filter to only leads that have linked contacts
-      const leadsWithContacts = leads.filter(
-        (l) => getLinkedContactIds(l).length > 0
-      );
+    // ── PHASE 1: Auto-match unlinked leads ─────────────────────────────────
+    console.log("\n  🔍 Phase 1: Auto-matching unlinked leads...");
 
-      if (!leadsWithContacts.length) continue;
+    const unlinkedLeads = allLeads.filter(
+      (l) => getLinkedContactIds(l).length === 0
+    );
 
-      // Collect all unique contact IDs needed
-      const allContactIds = [
-        ...new Set(leadsWithContacts.flatMap(getLinkedContactIds)),
-      ];
+    for (const lead of unlinkedLeads) {
+      const matchId = findMatch(lead, contactIndex);
 
-      // Fetch contact data
-      const contacts = await fetchContactsByIds(allContactIds);
-      const contactMap = Object.fromEntries(contacts.map((c) => [c.id, c]));
-
-      // For each lead, take the first linked contact and sync its data
-      for (const lead of leadsWithContacts) {
-        const contactIds = getLinkedContactIds(lead);
-        const primaryContact = contactMap[contactIds[0]];
-
-        if (!primaryContact) {
-          console.log(`  ⚠️  Lead "${lead.name}" — contact ID ${contactIds[0]} not found`);
-          skippedLeads++;
-          continue;
-        }
-
-        const contactData = parseContact(primaryContact);
-
-        // Check if lead already has this data (avoid unnecessary writes)
-        const currentName  = lead.column_values.find((c) => c.id === LEADS_COLS.contactName)?.text || "";
-        const currentEmail = lead.column_values.find((c) => c.id === LEADS_COLS.email)?.text || "";
-        const currentPhone = lead.column_values.find((c) => c.id === LEADS_COLS.phone)?.text || "";
-
-        const needsUpdate =
-          (contactData.fullName && contactData.fullName !== currentName) ||
-          (contactData.email    && contactData.email    !== currentEmail) ||
-          (contactData.phone    && contactData.phone    !== currentPhone);
-
-        if (!needsUpdate) {
-          skippedLeads++;
-          continue;
-        }
-
-        const updated = await updateLead(lead.id, contactData);
-        if (updated) {
-          console.log(`  ✅ Updated "${lead.name}" → ${contactData.fullName} ${contactData.phone || ""} ${contactData.email || ""}`);
-          updatedLeads++;
-        }
-
-        // Rate limit: stay well within monday.com's 60 req/min limit
-        await sleep(300);
+      if (!matchId) {
+        skipped++;
+        continue;
       }
-    } while (cursor);
 
+      const matchedContact = contactMap[matchId];
+      console.log(`  🔗 Matched "${lead.name}" → "${matchedContact?.name}"`);
+
+      await linkContactToLead(lead.id, matchId);
+      autoMatched++;
+
+      // Inject the link into the in-memory lead so Phase 2 picks it up now
+      const relCol = lead.column_values.find((c) => c.id === LEADS_COLS.contactRelation);
+      if (relCol) {
+        relCol.value = JSON.stringify({ linkedPulseIds: [{ linkedPulseId: Number(matchId) }] });
+      }
+
+      await sleep(350);
+    }
+
+    // ── PHASE 2: Sync contact data into all linked leads ───────────────────
+    console.log("\n  📝 Phase 2: Syncing contact data into leads...");
+
+    const linkedLeads = allLeads.filter(
+      (l) => getLinkedContactIds(l).length > 0
+    );
+
+    for (const lead of linkedLeads) {
+      const contactIds     = getLinkedContactIds(lead);
+      const primaryContact = contactMap[contactIds[0]];
+
+      if (!primaryContact) {
+        console.log(`  ⚠️  Lead "${lead.name}" — linked contact not found in board`);
+        skipped++;
+        continue;
+      }
+
+      const contactData = parseContact(primaryContact);
+
+      const currentName  = lead.column_values.find((c) => c.id === LEADS_COLS.contactName)?.text || "";
+      const currentEmail = lead.column_values.find((c) => c.id === LEADS_COLS.email)?.text  || "";
+      const currentPhone = lead.column_values.find((c) => c.id === LEADS_COLS.phone)?.text  || "";
+
+      const needsUpdate =
+        (contactData.fullName && contactData.fullName !== currentName) ||
+        (contactData.email    && contactData.email    !== currentEmail) ||
+        (contactData.phone    && contactData.phone    !== currentPhone);
+
+      if (!needsUpdate) {
+        skipped++;
+        continue;
+      }
+
+      const updated = await updateLeadFields(lead.id, contactData);
+      if (updated) {
+        console.log(`  ✅ Updated "${lead.name}" → ${contactData.fullName} ${contactData.phone || ""} ${contactData.email || ""}`.trim());
+        dataUpdated++;
+      }
+
+      await sleep(350);
+    }
+
+    // ── Summary ────────────────────────────────────────────────────────────
     console.log(`\n[${new Date().toISOString()}] ✅ Sync complete.`);
-    console.log(`   Total leads scanned: ${totalLeads}`);
-    console.log(`   Leads updated:       ${updatedLeads}`);
-    console.log(`   Leads skipped:       ${skippedLeads} (no change needed / no contact data)`);
+    console.log(`   Leads scanned:   ${allLeads.length}`);
+    console.log(`   Auto-matched:    ${autoMatched}  (contact linked automatically)`);
+    console.log(`   Data updated:    ${dataUpdated}  (fields copied from contact)`);
+    console.log(`   Skipped:         ${skipped}  (no match / already up to date)`);
 
   } catch (err) {
     console.error(`\n[${new Date().toISOString()}] ❌ Sync failed:`, err.message);
+    console.error(err.stack);
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 // ─── Cron schedule ─────────────────────────────────────────────────────────
-// Runs at: 8am, 12pm, 4pm, 8pm — Dubai time (UTC+4)
-// Cron times below are UTC (subtract 4 hours)
-//   8am  Dubai = 4am  UTC
-//   12pm Dubai = 8am  UTC
-//   4pm  Dubai = 12pm UTC
-//   8pm  Dubai = 4pm  UTC
+// 8am, 12pm, 4pm, 8pm Dubai time (UTC+4 → subtract 4 for UTC)
 
 const SCHEDULES = [
-  "0 4 * * *",   //  8:00am Dubai
-  "0 8 * * *",   // 12:00pm Dubai
+  "0 4  * * *",  //  8:00am Dubai
+  "0 8  * * *",  // 12:00pm Dubai
   "0 12 * * *",  //  4:00pm Dubai
   "0 16 * * *",  //  8:00pm Dubai
 ];
@@ -349,5 +428,5 @@ for (const schedule of SCHEDULES) {
   cron.schedule(schedule, runSync, { timezone: "UTC" });
 }
 
-// Run immediately on startup so you can verify it works
+// Run immediately on startup
 runSync();
